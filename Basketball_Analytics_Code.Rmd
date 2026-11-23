@@ -1,0 +1,254 @@
+---
+title: "Predicting Point Differential × Steals for 7 NBA Games"
+author: "Riley Conner"
+date: "December 2025"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Goal
+
+Predict the total point differential × total steals across 7 NBA games, using team box-score
+statistics from recent games.
+
+The original version of this project (a class prediction competition) let the model use
+point differential, steals and the final scores as predictors. Those are the pieces the
+response is built from, so the model looked very accurate but could not truly forecast a game
+that hasn't happened yet. This version removes them, compares several models on a held-out
+test set, and makes the forecast with a model that only uses ordinary box-score stats.
+
+```{r libraries}
+library(tidyverse)
+library(randomForest)
+library(knitr)
+```
+
+## Data
+
+Both files should sit in the same folder as this file (sources listed at the end).
+
+```{r load-data}
+scores <- read_csv("TeamStatistics.csv")
+steals <- read_csv("team_traditional.csv")
+```
+
+```{r clean}
+# Keep only the 14 teams playing in the 7 games being predicted
+teams   <- c("Magic", "Knicks", "Celtics", "Raptors", "Nuggets", "Hornets", "Trail Blazers",
+             "Grizzlies", "Warriors", "Bulls", "Lakers", "76ers", "Thunder", "Jazz")
+abbrevs <- c("ORL", "NYK", "BOS", "TOR", "DEN", "CHA", "POR",
+             "MEM", "GSW", "CHI", "LAL", "PHI", "OKC", "UTA")
+
+scores2 <- scores %>%
+  filter(teamName %in% teams)
+
+steals2 <- steals %>%
+  filter(home %in% abbrevs) %>%
+  rename(gameId = gameid) %>%            # match the ID name in the scores data
+  filter(date >= as.Date("2025-01-01"))  # recent games only
+
+# Join on game ID, then keep one row per game
+# (each game appears twice, once from each team's side)
+games <- scores2 %>%
+  inner_join(steals2, by = "gameId") %>%
+  distinct(gameId, .keep_all = TRUE) %>%
+  mutate(points_diff = abs(teamScore - opponentScore),
+         y = points_diff * steals)
+
+nrow(games)
+```
+
+## Predictors
+
+`y` is built from point differential and steals, so any column that contains those numbers
+(or the final scores) would let the model "see" part of the answer. Those columns are excluded.
+
+```{r predictors}
+box_preds <- c("FGM", "FGA", "FG%", "3PM", "3PA", "3P%", "FTM", "FTA", "FT%",
+               "OREB", "DREB", "REB", "AST", "TOV", "BLK", "PF")
+leaky     <- c("points_diff", "STL", "teamScore", "opponentScore", "+/-")
+
+model_data <- games %>%
+  select(teamName, all_of(box_preds), all_of(leaky), y) %>%
+  drop_na()
+
+summary(model_data$y)
+```
+
+## Exploratory data analysis
+
+```{r eda}
+ggplot(model_data, aes(x = y)) +
+  geom_histogram(bins = 30, fill = "steelblue") +
+  labs(title = "Distribution of Point Differential × Steals per Game",
+       x = "Point differential × steals", y = "Games") +
+  theme_minimal()
+
+# Correlation of each box-score stat with y
+model_data %>%
+  summarise(across(all_of(box_preds), ~ cor(.x, y))) %>%
+  pivot_longer(everything(), names_to = "Stat", values_to = "Correlation") %>%
+  ggplot(aes(x = reorder(Stat, Correlation), y = Correlation)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Correlation with Point Differential × Steals", x = "Stat", y = "Correlation") +
+  theme_minimal()
+```
+
+## Train/test split
+
+```{r split}
+set.seed(455)
+train_rows <- sample(nrow(model_data), size = floor(0.7 * nrow(model_data)))
+train <- model_data[train_rows, ]
+test  <- model_data[-train_rows, ]
+```
+
+## Models
+
+```{r models}
+box_formula <- reformulate(sprintf("`%s`", box_preds), "y")
+
+# 1. Empty model: predicts the training average for every game
+empty_pred <- rep(mean(train$y), nrow(test))
+
+# 2. Original class model, for reference only: it uses point differential, steals and the
+#    final scores, which are part of the response
+original_model <- lm(y ~ points_diff + STL + TOV + teamScore + opponentScore +
+                       AST + PF + `FT%` + BLK, data = train)
+original_pred <- predict(original_model, newdata = test)
+
+# 3. Stepwise regression using box-score stats only
+full  <- lm(box_formula, data = train)
+empty <- lm(y ~ 1, data = train)
+step_model <- step(empty, scope = list(upper = full), direction = "both", trace = 0)
+formula(step_model)
+step_pred <- predict(step_model, newdata = test)
+
+# 4. Same predictors with a square-root transformation on y
+#    (y is right-skewed, as the histogram shows)
+sqrt_formula <- update(formula(step_model), sqrt(y) ~ .)
+sqrt_model <- lm(sqrt_formula, data = train)
+sqrt_pred <- predict(sqrt_model, newdata = test)^2   # square to undo the transformation
+
+# 5. Random forest using all box-score stats
+set.seed(455)
+rf_model <- randomForest(x = train[, box_preds], y = train$y, importance = TRUE)
+rf_pred <- predict(rf_model, newdata = test[, box_preds])
+```
+
+## Comparing models on the test set
+
+RMSE is how far off the predictions are, on average, in the units of y. Lower is better.
+
+```{r rmse}
+rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2))
+
+results <- tibble(
+  Model = c("Empty (training average)",
+            "Original class model (uses parts of the answer)",
+            "Stepwise, box-score stats",
+            "Stepwise, square root of y",
+            "Random forest, box-score stats"),
+  Forecastable = c("Yes", "No", "Yes", "Yes", "Yes"),
+  RMSE = c(rmse(test$y, empty_pred),
+           rmse(test$y, original_pred),
+           rmse(test$y, step_pred),
+           rmse(test$y, sqrt_pred),
+           rmse(test$y, rf_pred))
+) %>%
+  arrange(RMSE)
+
+kable(results, digits = 2)
+```
+
+```{r rmse-plot}
+ggplot(results, aes(x = reorder(Model, -RMSE), y = RMSE,
+                    fill = Forecastable)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Yes" = "steelblue", "No" = "grey60")) +
+  labs(x = NULL, y = "Test RMSE", title = "Test RMSE by Model") +
+  theme_minimal()
+```
+
+## Diagnostics for the regression models
+
+```{r diagnostics}
+par(mfrow = c(2, 2))
+plot(step_model, which = 1:2, main = "Stepwise")
+plot(sqrt_model, which = 1:2, main = "Square root of y")
+par(mfrow = c(1, 1))
+```
+
+## Variable importance (random forest)
+
+```{r importance}
+tibble(Stat = rownames(importance(rf_model)),
+       Importance = importance(rf_model)[, "%IncMSE"]) %>%
+  ggplot(aes(x = reorder(Stat, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance", x = "Stat", y = "% Increase in MSE") +
+  theme_minimal()
+```
+
+## Forecast for the 7 games
+
+The forecast uses the forecastable model with the lowest test RMSE. For each of the 7 home
+teams, the model is given that team's average box-score stats.
+
+```{r forecast}
+forecastable <- results %>% filter(Forecastable == "Yes")
+best_model <- forecastable$Model[1]
+best_model
+
+predict_best <- function(newdata) {
+  switch(best_model,
+         "Empty (training average)"       = rep(mean(train$y), nrow(newdata)),
+         "Stepwise, box-score stats"      = predict(step_model, newdata = newdata),
+         "Stepwise, square root of y"     = predict(sqrt_model, newdata = newdata)^2,
+         "Random forest, box-score stats" = predict(rf_model, newdata = newdata[, box_preds]))
+}
+
+# Average box-score stats for each team
+team_avgs <- model_data %>%
+  group_by(teamName) %>%
+  summarise(across(all_of(box_preds), mean))
+
+home_teams <- tibble(teamName = c("Knicks", "Raptors", "Hornets", "Grizzlies",
+                                  "Bulls", "76ers", "Jazz"))
+
+forecast_data <- home_teams %>%
+  left_join(team_avgs, by = "teamName")
+
+game_preds <- predict_best(forecast_data)
+kable(tibble(Home_team = home_teams$teamName, Predicted_y = game_preds), digits = 1)
+
+# The target is (total point differential) × (total steals) across all 7 games.
+# Summing 7 per-game products and multiplying by 7 approximates that when games are similar.
+final_pred <- sum(game_preds) * 7
+final_pred
+```
+
+## Sanity check
+
+```{r sanity-check}
+avg_diff   <- mean(model_data$points_diff)
+avg_steals <- mean(model_data$STL)
+(7 * avg_diff) * (7 * avg_steals)
+```
+
+## Sources
+
+- Moore, E. A. (2025, December 1). *NBA dataset: Box scores & stats, 1947–today.* Kaggle.
+  https://www.kaggle.com/datasets/eoinamoore/historical-nba-data-and-player-box-scores
+- Jóźwiak, S. (2025, November 11). *NBA traditional boxscores 1997–2025.* Kaggle.
+  https://www.kaggle.com/datasets/szymonjwiak/nba-traditional
+- Wickham, H., François, R., Henry, L., Müller, K., & Vaughan, D. (2023). *dplyr: Keep
+  distinct/unique rows.* Posit Software, PBC. https://dplyr.tidyverse.org/reference/distinct.html
